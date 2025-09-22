@@ -1,0 +1,364 @@
+name: "🔄 Reusable Security CI Pipeline"
+
+# Cross-repository workflow sync from BeaconAgileHub-security-CI-CDpipelines
+# This workflow demonstrates DRY principles by consuming reusable workflows
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: false
+        type: string
+        default: 'development'
+      security_severity:
+        description: 'Security severity threshold'
+        required: false
+        type: string
+        default: 'medium'
+      language:
+        description: 'Primary language for scanning'
+        required: false
+        type: string
+        default: 'python'
+      fail_on_severity:
+        description: 'Fail pipeline on security findings'
+        required: false
+        type: boolean
+        default: false
+      enable_monitoring:
+        description: 'Enable monitoring integration'
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AWS_ROLE_ARN:
+        required: false
+      SNYK_TOKEN:
+        required: false
+      GITHUB_TOKEN:
+        required: true
+      VPS_SSH_KEY:
+        required: false
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - 'development'
+          - 'staging'
+          - 'production'
+      security_severity:
+        description: 'Security severity threshold'
+        required: true
+        default: 'medium'
+        type: choice
+        options:
+          - 'low'
+          - 'medium'
+          - 'high'
+          - 'critical'
+      test_eda_integration:
+        description: 'Test EDA/N8N integration'
+        required: false
+        type: boolean
+        default: false
+
+  pull_request:
+    branches: [ "main", "n8n" ]
+    paths:
+      - '**.py'
+      - '**.yml'
+      - '**.yaml'
+      - '**.tf'
+      - '**.json'
+      - 'Dockerfile*'
+      - '.github/workflows/**'
+
+  push:
+    branches: [ "main", "n8n" ]
+    paths:
+      - '**.py'
+      - '**.yml'
+      - '**.yaml'
+      - '**.tf'
+      - '**.json'
+      - 'Dockerfile*'
+      - '.github/workflows/**'
+
+concurrency:
+  group: security-ci-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  # DRY Environment Variables
+  WORKFLOW_ENV: ${{ inputs.environment || 'development' }}
+  SECURITY_SEVERITY: ${{ inputs.security_severity || 'medium' }}
+  FAIL_ON_SECURITY: ${{ inputs.fail_on_severity || false }}
+  ENABLE_MONITORING: ${{ inputs.enable_monitoring || true }}
+  
+  # Repository-specific configurations
+  PRIMARY_LANGUAGE: ${{ inputs.language || 'python' }}
+  REPOSITORY_TYPE: "enterprise-superlab"
+  BRANCH_NAME: ${{ github.ref_name }}
+  
+  # Cross-repo integration endpoints
+  EDA_ENDPOINT: ${{ vars.EDA_ENDPOINT || 'http://148.230.94.85:5000/security-alert' }}
+  GRAFANA_ENDPOINT: ${{ vars.GRAFANA_ENDPOINT || 'http://148.230.94.85:3000' }}
+  
+jobs:
+  # Environment setup and validation
+  environment-setup:
+    name: "🌍 Environment Setup"
+    runs-on: ubuntu-22.04
+    outputs:
+      environment: ${{ steps.setup.outputs.environment }}
+      security_config: ${{ steps.setup.outputs.security_config }}
+      monitoring_enabled: ${{ steps.setup.outputs.monitoring_enabled }}
+      
+    steps:
+      - name: "📝 Environment Configuration"
+        id: setup
+        run: |
+          echo "environment=$WORKFLOW_ENV" >> $GITHUB_OUTPUT
+          echo "monitoring_enabled=$ENABLE_MONITORING" >> $GITHUB_OUTPUT
+          
+          # Security configuration based on environment
+          case "$WORKFLOW_ENV" in
+            "production")
+              SECURITY_CONFIG='{"fail_on_critical":true,"fail_on_high":true,"enable_sbom":true,"compliance_required":true}'
+              ;;
+            "staging")
+              SECURITY_CONFIG='{"fail_on_critical":true,"fail_on_high":false,"enable_sbom":true,"compliance_required":true}'
+              ;;
+            *)
+              SECURITY_CONFIG='{"fail_on_critical":false,"fail_on_high":false,"enable_sbom":true,"compliance_required":false}'
+              ;;
+          esac
+          
+          echo "security_config=$SECURITY_CONFIG" >> $GITHUB_OUTPUT
+          echo "🎯 Environment: $WORKFLOW_ENV"
+          echo "🛡️ Security Config: $SECURITY_CONFIG"
+
+  # Reusable Security Gates from BeaconAgileHub repository
+  security-gates:
+    name: "🛡️ Security Gates (Reusable)"
+    uses: papaert-cloud/BeaconAgileHub-security-CI-CDpipelines/.github/workflows/enhanced-security-gates.yml@S-lab
+    needs: environment-setup
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    with:
+      environment: ${{ needs.environment-setup.outputs.environment }}
+      severity_threshold: ${{ env.SECURITY_SEVERITY }}
+      fail_on_severity: ${{ env.FAIL_ON_SECURITY }}
+      enable_sbom: true
+      scan_tools: "kics,checkov,trivy"
+      
+  # Reusable CI Pipeline from BeaconAgileHub repository  
+  ci-pipeline:
+    name: "🔄 CI Pipeline (Reusable)"
+    uses: papaert-cloud/BeaconAgileHub-security-CI-CDpipelines/.github/workflows/enhanced-ci-pipeline.yml@S-lab
+    needs: [environment-setup, security-gates]
+    secrets: inherit
+    with:
+      environment: ${{ needs.environment-setup.outputs.environment }}
+      language: ${{ env.PRIMARY_LANGUAGE }}
+      security_severity: ${{ env.SECURITY_SEVERITY }}
+      
+  # Custom enterprise-specific validation
+  enterprise-validation:
+    name: "🏢 Enterprise Validation"
+    runs-on: ubuntu-22.04
+    needs: [environment-setup, security-gates]
+    
+    steps:
+      - name: "🔍 Checkout Repository"
+        uses: actions/checkout@v4
+        
+      - name: "📝 Enterprise Compliance Check"
+        run: |
+          echo "🏢 Running enterprise-specific validations..."
+          
+          # Check for required enterprise files
+          REQUIRED_FILES=("SECURITY.md" "COMPLIANCE.md" "CODE_OF_CONDUCT.md")
+          MISSING_FILES=()
+          
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$file" ]; then
+              MISSING_FILES+=("$file")
+            fi
+          done
+          
+          if [ ${#MISSING_FILES[@]} -gt 0 ]; then
+            echo "⚠️ Missing required enterprise files: ${MISSING_FILES[*]}"
+            echo "This is a warning for enterprise-devsecops-superlab"
+          else
+            echo "✅ All required enterprise files present"
+          fi
+          
+      - name: "📈 Enterprise Metrics Collection"
+        run: |
+          echo "📈 Collecting enterprise metrics..."
+          
+          # Repository statistics
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          BRANCH_COUNT=$(git branch -r | wc -l)
+          
+          echo "Repository Statistics:"
+          echo "  Commits: $COMMIT_COUNT"
+          echo "  Remote Branches: $BRANCH_COUNT"
+          echo "  Current Branch: ${{ github.ref_name }}"
+          echo "  Repository: ${{ github.repository }}"
+          
+          # Send metrics to monitoring (if enabled)
+          if [ "$ENABLE_MONITORING" = "true" ] && [ -n "$GRAFANA_ENDPOINT" ]; then
+            echo "📈 Sending metrics to Grafana..."
+            curl -X POST "$GRAFANA_ENDPOINT/api/annotations" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "text": "Enterprise CI Pipeline Completed",
+                "tags": ["enterprise", "ci", "'${{ github.ref_name }}'"]
+              }' || echo "Metrics sending failed (non-blocking)"
+          fi
+
+  # EDA Integration Testing (conditional)
+  test-eda-integration:
+    name: "⚡ Test EDA Integration"
+    if: github.event.inputs.test_eda_integration == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    needs: [environment-setup, ci-pipeline]
+    
+    steps:
+      - name: "⚡ Send Test Event to EDA"
+        run: |
+          echo "⚡ Testing EDA integration from enterprise repository..."
+          
+          TEST_PAYLOAD=$(cat <<EOF
+          {
+            "severity": "$SECURITY_SEVERITY",
+            "summary": "Enterprise repository CI test event",
+            "affected_systems": ["enterprise-devsecops-superlab"],
+            "source": "github-actions-enterprise",
+            "environment": "$WORKFLOW_ENV",
+            "repository": "${{ github.repository }}",
+            "branch": "${{ github.ref_name }}",
+            "workflow_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "test_type": "cross_repo_integration",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          )
+          
+          echo "📤 Sending to EDA endpoint: $EDA_ENDPOINT"
+          curl -X POST "$EDA_ENDPOINT" \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: Enterprise-Repo-CI/1.0" \
+            -d "$TEST_PAYLOAD" \
+            --connect-timeout 30 \
+            --max-time 60 || echo "⚠️ EDA integration test failed (non-blocking)"
+            
+  # Cross-repository sync validation
+  cross-repo-sync:
+    name: "🔄 Cross-Repository Sync"
+    runs-on: ubuntu-22.04
+    needs: [environment-setup, security-gates, ci-pipeline]
+    
+    steps:
+      - name: "📊 Sync Status Report"
+        run: |
+          echo "# 🔄 Cross-Repository Sync Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source Repository**: papaert-cloud/BeaconAgileHub-security-CI-CDpipelines" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: $WORKFLOW_ENV" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security Severity**: $SECURITY_SEVERITY" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Reusable Workflows" >> $GITHUB_STEP_SUMMARY
+          echo "| Workflow | Status | Source |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Gates | ${{ needs.security-gates.result == 'success' && '✅' || '❌' }} | BeaconAgileHub@S-lab |" >> $GITHUB_STEP_SUMMARY
+          echo "| CI Pipeline | ${{ needs.ci-pipeline.result == 'success' && '✅' || '❌' }} | BeaconAgileHub@S-lab |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## DRY Benefits" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Centralized security policies" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Consistent tooling across repositories" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Reduced maintenance overhead" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Standardized compliance validation" >> $GITHUB_STEP_SUMMARY
+          
+      - name: "📊 Update Cross-Repo Metrics"
+        if: env.ENABLE_MONITORING == 'true'
+        run: |
+          echo "📊 Updating cross-repository metrics..."
+          
+          # Create metrics payload
+          METRICS_PAYLOAD=$(cat <<EOF
+          {
+            "source_repo": "BeaconAgileHub-security-CI-CDpipelines",
+            "target_repo": "${{ github.repository }}",
+            "workflow_success": ${{ needs.security-gates.result == 'success' && needs.ci-pipeline.result == 'success' }},
+            "environment": "$WORKFLOW_ENV",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "metrics": {
+              "security_gates_duration": "${{ needs.security-gates.result }}",
+              "ci_pipeline_duration": "${{ needs.ci-pipeline.result }}",
+              "total_jobs": 6
+            }
+          }
+          EOF
+          )
+          
+          echo "Metrics payload: $METRICS_PAYLOAD"
+          echo "✅ Cross-repository sync metrics collected"
+
+  # Final validation summary
+  validation-summary:
+    name: "📋 Validation Summary"
+    runs-on: ubuntu-22.04
+    needs: [environment-setup, security-gates, ci-pipeline, enterprise-validation, test-eda-integration, cross-repo-sync]
+    if: always()
+    
+    steps:
+      - name: "📋 Generate Final Report"
+        run: |
+          echo "# 🏢 Enterprise DevSecOps Superlab - Validation Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Overall Status" >> $GITHUB_STEP_SUMMARY
+          
+          # Determine overall status
+          SECURITY_SUCCESS=${{ needs.security-gates.result == 'success' }}
+          CI_SUCCESS=${{ needs.ci-pipeline.result == 'success' }}
+          ENTERPRISE_SUCCESS=${{ needs.enterprise-validation.result == 'success' }}
+          
+          if [ "$SECURITY_SUCCESS" = "true" ] && [ "$CI_SUCCESS" = "true" ] && [ "$ENTERPRISE_SUCCESS" = "true" ]; then
+            echo "🎉 **ALL VALIDATIONS PASSED** - Ready for deployment" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🚀 **Recommendation**: Proceed with deployment to $WORKFLOW_ENV" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **SOME VALIDATIONS FAILED** - Review required" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔍 **Recommendation**: Address failing checks before deployment" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Detailed Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status | Notes |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment Setup | ${{ needs.environment-setup.result == 'success' && '✅' || '❌' }} | ${{ needs.environment-setup.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Gates | ${{ needs.security-gates.result == 'success' && '✅' || '❌' }} | ${{ needs.security-gates.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| CI Pipeline | ${{ needs.ci-pipeline.result == 'success' && '✅' || '❌' }} | ${{ needs.ci-pipeline.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Enterprise Validation | ${{ needs.enterprise-validation.result == 'success' && '✅' || '❌' }} | ${{ needs.enterprise-validation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| EDA Integration | ${{ needs.test-eda-integration.result == 'success' && '✅' || needs.test-eda-integration.result == 'skipped' && '⏭️' || '❌' }} | ${{ needs.test-eda-integration.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cross-Repo Sync | ${{ needs.cross-repo-sync.result == 'success' && '✅' || '❌' }} | ${{ needs.cross-repo-sync.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. 📊 Review monitoring dashboards: [Grafana]($GRAFANA_ENDPOINT)" >> $GITHUB_STEP_SUMMARY
+          echo "2. ⚡ Check EDA automation logs on VPS" >> $GITHUB_STEP_SUMMARY
+          echo "3. 🔄 Sync any required updates from BeaconAgileHub repository" >> $GITHUB_STEP_SUMMARY
+          echo "4. 🏢 Update enterprise compliance documentation if needed" >> $GITHUB_STEP_SUMMARY
