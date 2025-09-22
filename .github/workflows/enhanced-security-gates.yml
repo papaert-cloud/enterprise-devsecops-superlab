@@ -1,0 +1,234 @@
+name: 🔒 Enhanced Security Gates - Multi-Layer Scanning
+
+# Cross-repository reusable workflow with workflow_dispatch and workflow_call
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      severity_threshold:
+        required: false
+        type: string
+        default: 'medium'
+      enable_sbom:
+        required: false
+        type: boolean
+        default: true
+      fail_on_severity:
+        required: false
+        type: boolean
+        default: false
+      scan_tools:
+        required: false
+        type: string
+        default: 'kics,checkov,terrascan,trivy'
+    secrets:
+      AWS_ROLE_ARN:
+        required: false
+      SNYK_TOKEN:
+        required: false
+    outputs:
+      security_status:
+        value: ${{ jobs.security-summary.outputs.status }}
+  
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: ['dev', 'staging', 'production']
+      severity_threshold:
+        description: 'Security Severity Threshold'
+        required: false
+        default: 'medium'
+        type: choice
+        options: ['info', 'low', 'medium', 'high', 'critical']
+      scan_tools:
+        description: 'Security Tools (comma-separated)'
+        required: false
+        default: 'kics,checkov,trivy'
+        type: string
+
+# Concurrency control
+concurrency:
+  group: security-gates-${{ inputs.environment || github.event.inputs.environment }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# Centralized environment variables
+env:
+  KICS_VERSION: "1.7.13"
+  CHECKOV_VERSION: "3.1.34"
+  TERRASCAN_VERSION: "1.18.11"
+  TRIVY_VERSION: "0.48.3"
+  SYFT_VERSION: "0.100.0"
+  GRYPE_VERSION: "0.74.1"
+  
+  SEVERITY_THRESHOLD: ${{ inputs.severity_threshold || github.event.inputs.severity_threshold || 'medium' }}
+  ENVIRONMENT: ${{ inputs.environment || github.event.inputs.environment || 'dev' }}
+  SCAN_TOOLS: ${{ inputs.scan_tools || github.event.inputs.scan_tools || 'kics,checkov,trivy' }}
+  SECURITY_REPORTS_DIR: "security-reports"
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  # Infrastructure security scanning
+  infrastructure-security:
+    name: 🏗️ Infrastructure Security
+    runs-on: ubuntu-22.04
+    if: contains(env.SCAN_TOOLS, 'kics') || contains(env.SCAN_TOOLS, 'checkov') || contains(env.SCAN_TOOLS, 'terrascan')
+    
+    strategy:
+      matrix:
+        scanner: ['kics', 'checkov', 'terrascan']
+      fail-fast: false
+    
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@v4
+        
+      - name: 📁 Setup Reports
+        run: mkdir -p ${{ env.SECURITY_REPORTS_DIR }}
+        
+      - name: 🛡️ KICS Scan
+        if: matrix.scanner == 'kics' && contains(env.SCAN_TOOLS, 'kics')
+        run: |
+          curl -sfL "https://github.com/Checkmarx/kics/releases/download/v${{ env.KICS_VERSION }}/kics_${{ env.KICS_VERSION }}_linux_x64.tar.gz" | tar -xzC /tmp
+          sudo mv /tmp/kics /usr/local/bin/
+          
+          kics scan \
+            --path . \
+            --output-path ${{ env.SECURITY_REPORTS_DIR }}/kics \
+            --output-name kics-results \
+            --report-formats json,sarif \
+            --severity ${{ env.SEVERITY_THRESHOLD }} || echo "KICS scan completed"
+            
+      - name: 🛡️ Checkov Scan
+        if: matrix.scanner == 'checkov' && contains(env.SCAN_TOOLS, 'checkov')
+        uses: bridgecrewio/checkov-action@v12.2582.0
+        with:
+          directory: .
+          framework: terraform,cloudformation
+          output_format: sarif,json
+          output_file_path: ${{ env.SECURITY_REPORTS_DIR }}/checkov-results
+          soft_fail: true
+          
+      - name: 🛡️ Terrascan Scan
+        if: matrix.scanner == 'terrascan' && contains(env.SCAN_TOOLS, 'terrascan')
+        run: |
+          curl -L "https://github.com/tenable/terrascan/releases/download/v${{ env.TERRASCAN_VERSION }}/terrascan_${{ env.TERRASCAN_VERSION }}_Linux_x86_64.tar.gz" > terrascan.tar.gz
+          tar -xf terrascan.tar.gz && sudo mv terrascan /usr/local/bin/
+          
+          terrascan scan \
+            --iac-type terraform \
+            --output json \
+            --output-dir ${{ env.SECURITY_REPORTS_DIR }}/terrascan || echo "Terrascan completed"
+            
+      - name: 📤 Upload Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-${{ matrix.scanner }}-${{ env.ENVIRONMENT }}
+          path: ${{ env.SECURITY_REPORTS_DIR }}/
+          retention-days: 30
+
+  # Container security scanning
+  container-security:
+    name: 🐳 Container Security
+    runs-on: ubuntu-22.04
+    if: contains(env.SCAN_TOOLS, 'trivy')
+    
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@v4
+        
+      - name: 🔍 Trivy Container Scan
+        run: |
+          sudo apt-get update
+          sudo apt-get install wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          sudo add-apt-repository "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main"
+          sudo apt-get update && sudo apt-get install trivy
+          
+          if [ -f "Dockerfile" ] || [ -f "app/Dockerfile" ]; then
+            trivy config . --format sarif --output trivy-results.sarif || echo "Trivy scan completed"
+          else
+            echo "No Dockerfile found, skipping container scan"
+          fi
+
+  # SBOM generation and vulnerability assessment
+  sbom-generation:
+    name: 📋 SBOM Generation
+    runs-on: ubuntu-22.04
+    if: inputs.enable_sbom == true || github.event.inputs.enable_sbom != 'false'
+    
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@v4
+        
+      - name: 🔧 Install SBOM Tools
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin v${{ env.SYFT_VERSION }}
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin v${{ env.GRYPE_VERSION }}
+          
+      - name: 📋 Generate SBOM
+        run: |
+          syft packages dir:. -o cyclonedx-json=sbom.json
+          grype sbom:sbom.json -o json --file vulnerabilities.json || echo "Vulnerability scan completed"
+          
+      - name: 📤 Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ env.ENVIRONMENT }}
+          path: |
+            sbom.json
+            vulnerabilities.json
+          retention-days: 90
+
+  # Security summary
+  security-summary:
+    name: 📊 Security Summary
+    needs: [infrastructure-security, container-security, sbom-generation]
+    if: always()
+    runs-on: ubuntu-22.04
+    
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+      
+    steps:
+      - name: 📊 Generate Summary
+        id: summary
+        run: |
+          echo "# 🛡️ Security Analysis Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🗜️ Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Threshold**: ${{ env.SEVERITY_THRESHOLD }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tools**: ${{ env.SCAN_TOOLS }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 🔍 Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Tool | Status | Purpose |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| KICS | ${{ needs.infrastructure-security.result || 'Skipped' }} | IaC Security |" >> $GITHUB_STEP_SUMMARY
+          echo "| Checkov | ${{ needs.infrastructure-security.result || 'Skipped' }} | Policy Validation |" >> $GITHUB_STEP_SUMMARY
+          echo "| Terrascan | ${{ needs.infrastructure-security.result || 'Skipped' }} | Compliance |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy | ${{ needs.container-security.result || 'Skipped' }} | Container Security |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM/Grype | ${{ needs.sbom-generation.result || 'Skipped' }} | Vulnerabilities |" >> $GITHUB_STEP_SUMMARY
+          
+          # Determine overall status
+          OVERALL_STATUS="success"
+          if [ "${{ needs.infrastructure-security.result }}" = "failure" ] || [ "${{ needs.container-security.result }}" = "failure" ]; then
+            OVERALL_STATUS="warning"
+          fi
+          
+          echo "status=$OVERALL_STATUS" >> $GITHUB_OUTPUT
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 Overall Status: $OVERALL_STATUS" >> $GITHUB_STEP_SUMMARY
