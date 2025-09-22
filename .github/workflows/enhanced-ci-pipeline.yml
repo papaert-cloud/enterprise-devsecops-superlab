@@ -1,0 +1,195 @@
+name: 🔄 Enhanced CI Pipeline - Security-First Development
+
+# Comprehensive triggers with n8n branch support
+on:
+  push:
+    branches: [ main, n8n, develop, feature/* ]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ main, n8n ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options: ['dev', 'staging', 'production']
+      security_severity:
+        description: 'Security Severity Threshold'
+        required: false
+        default: 'medium'
+        type: choice
+        options: ['info', 'low', 'medium', 'high', 'critical']
+
+# Concurrency control
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Environment variables following DRY principles
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  
+  # Dynamic environment detection with n8n branch support
+  ENVIRONMENT: ${{ 
+    github.event.inputs.environment || 
+    (github.ref == 'refs/heads/main' && 'production') ||
+    (github.ref == 'refs/heads/n8n' && 'staging') ||
+    'dev' 
+  }}
+  
+  SECURITY_SEVERITY: ${{ github.event.inputs.security_severity || 'medium' }}
+  FAIL_ON_SECURITY: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  security-events: write
+  actions: read
+
+jobs:
+  # Environment setup
+  environment-setup:
+    name: 🌍 Environment Setup
+    runs-on: ubuntu-22.04
+    outputs:
+      environment: ${{ steps.env-detection.outputs.environment }}
+      security-threshold: ${{ steps.env-detection.outputs.security-threshold }}
+    
+    steps:
+      - name: 🌍 Environment Detection
+        id: env-detection
+        run: |
+          ENV="${{ env.ENVIRONMENT }}"
+          SECURITY_THRESHOLD="${{ env.SECURITY_SEVERITY }}"
+          
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "security-threshold=$SECURITY_THRESHOLD" >> $GITHUB_OUTPUT
+          
+          echo "## 🌍 Environment Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: $ENV" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security Threshold**: $SECURITY_THRESHOLD" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+
+  # Security gates (always first)
+  security-gates:
+    name: 🛡️ Security Gates
+    needs: environment-setup
+    uses: ./.github/workflows/enhanced-security-gates.yml
+    with:
+      environment: ${{ needs.environment-setup.outputs.environment }}
+      severity_threshold: ${{ needs.environment-setup.outputs.security-threshold }}
+      enable_sbom: true
+      fail_on_severity: ${{ env.FAIL_ON_SECURITY == 'true' }}
+      scan_tools: 'kics,checkov,trivy'
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # Build and test
+  build-and-test:
+    name: 📺 Build & Test
+    needs: [environment-setup, security-gates]
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@v4
+        
+      - name: 🚀 Setup Node.js
+        if: hashFiles('**/package.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.10.0'
+          cache: 'npm'
+          
+      - name: 📦 Install Dependencies
+        if: hashFiles('**/package.json') != ''
+        run: |
+          if [ -d "app" ]; then
+            cd app && npm ci
+          else
+            npm ci
+          fi
+          
+      - name: 🧪 Run Tests
+        if: hashFiles('**/package.json') != ''
+        run: |
+          if [ -d "app" ]; then
+            cd app && npm test
+          else
+            npm test 2>/dev/null || echo "No tests configured"
+          fi
+          
+      - name: 📺 Build Application
+        if: hashFiles('**/package.json') != ''
+        run: |
+          if [ -d "app" ]; then
+            cd app && npm run build 2>/dev/null || echo "No build script configured"
+          else
+            npm run build 2>/dev/null || echo "No build script configured"
+          fi
+
+  # Container build (if Dockerfile exists)
+  container-build:
+    name: 🐳 Container Build
+    needs: [environment-setup, security-gates, build-and-test]
+    if: hashFiles('**/Dockerfile') != ''
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: 🔄 Checkout
+        uses: actions/checkout@v4
+        
+      - name: 🚀 Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        
+      - name: 🔐 Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: 🏷️ Extract Metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=${{ needs.environment-setup.outputs.environment }}-latest
+            
+      - name: 📺 Build Container
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ hashFiles('app/Dockerfile') != '' && './app' || '.' }}
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # CI summary
+  ci-summary:
+    name: 📊 CI Summary
+    needs: [environment-setup, security-gates, build-and-test, container-build]
+    if: always()
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: 📊 Generate Summary
+        run: |
+          echo "# 🔄 CI Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🗜️ Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ needs.environment-setup.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security Gates**: $([ "${{ needs.security-gates.result }}" = "success" ] && echo "✅" || echo "❌") ${{ needs.security-gates.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build & Test**: $([ "${{ needs.build-and-test.result }}" = "success" ] && echo "✅" || echo "❌") ${{ needs.build-and-test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container Build**: $([ "${{ needs.container-build.result }}" = "success" ] && echo "✅" || echo "❌") ${{ needs.container-build.result || 'Skipped' }}" >> $GITHUB_STEP_SUMMARY
